@@ -898,14 +898,17 @@ impl Stream for SseTranslator {
 /// The request body (`openai_body`) has already been converted from Anthropic
 /// Messages format to OpenAI Chat Completions format via `anthropic_to_openai_chat`.
 /// We forward it to the OpenCode upstream (`/zen/v1/chat/completions`), then
-/// convert the OpenAI SSE response back to Anthropic Messages SSE — the same
-/// way Mimo responses are handled — so clients see valid Anthropic events.
+/// convert the OpenAI SSE response back to Anthropic Messages SSE.
+///
+/// Unlike the Mimo path, we use a lightweight SSE translator that only handles
+/// text content deltas — no thinking blocks, tool calls, or extended signature
+/// management — since OpenCode free models are simpler.
 async fn opencode_via_anthropic(
     ctrl: Arc<ProxyController>,
     openai_body: Value,
     model: String,
     stream_requested: bool,
-    thinking_enabled: bool,
+    _thinking_enabled: bool,
     started: std::time::Instant,
 ) -> Response {
     // Rate-limit concurrent upstream calls.
@@ -928,12 +931,10 @@ async fn opencode_via_anthropic(
                 let text = upstream.text().await.unwrap_or_default();
                 return (status, text).into_response();
             }
-            // OpenCode returns OpenAI Chat Completions SSE, so we need to
-            // convert back to Anthropic Messages format — same as Mimo.
             if stream_requested {
-                stream_anthropic(upstream, model, ctrl.usage.clone(), thinking_enabled)
+                opencode_stream_anthropic(upstream, model, ctrl.usage.clone())
             } else {
-                aggregate_anthropic(upstream, model, ctrl.usage.clone(), thinking_enabled).await
+                aggregate_anthropic(upstream, model, ctrl.usage.clone(), false).await
             }
         }
         Err(e) => {
@@ -950,6 +951,268 @@ async fn opencode_via_anthropic(
             map_err(e)
         }
     }
+}
+
+/// Lightweight OpenAI SSE → Anthropic SSE streaming converter for OpenCode.
+///
+/// Extracts text deltas from `choices[0].delta.content` and emits Anthropic
+/// `content_block_start`/`content_block_delta`/`content_block_stop` events.
+/// No thinking blocks, tool calls, or usage tracking — OpenCode free models
+/// are simple text-only responses.
+struct OpenCodeSseTranslator {
+    inner: futures::stream::BoxStream<'static, std::result::Result<Bytes, reqwest::Error>>,
+    decoder: crate::decode::Utf8Stream,
+    buf: String,
+    model: String,
+    usage: Arc<crate::usage::UsageStore>,
+    started: bool,
+    finished: bool,
+    block_started: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    stop_reason: String,
+}
+
+impl OpenCodeSseTranslator {
+    fn new(
+        inner: futures::stream::BoxStream<'static, std::result::Result<Bytes, reqwest::Error>>,
+        model: String,
+        usage: Arc<crate::usage::UsageStore>,
+    ) -> Self {
+        Self {
+            inner,
+            decoder: crate::decode::Utf8Stream::new(),
+            buf: String::new(),
+            model,
+            usage,
+            started: false,
+            finished: false,
+            block_started: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: String::new(),
+        }
+    }
+
+    fn pop_event(&mut self) -> Option<String> {
+        let split = self.buf.find("\n\n")?;
+        let block = self.buf[..split].to_string();
+        self.buf.drain(..split + 2);
+        let mut data = String::new();
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest.trim_start());
+            }
+        }
+        Some(data)
+    }
+
+    fn translate(&mut self, data: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if data.is_empty() || data == "[DONE]" {
+            return out;
+        }
+        let chunk: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return out,
+        };
+
+        // Emit message_start on first event.
+        if !self.started {
+            self.started = true;
+            let msg_id = chunk
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
+            out.push(format!(
+                "event: message_start\ndata: {}\n\n",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                })
+            ));
+        }
+
+        // Extract usage.
+        if let Some(usage) = chunk.get("usage") {
+            if let Some(n) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                self.input_tokens = n;
+            }
+            if let Some(n) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                self.output_tokens = n;
+            }
+        }
+
+        let choices = match chunk.get("choices").and_then(|v| v.as_array()) {
+            Some(c) => c,
+            None => return out,
+        };
+
+        for ch in choices {
+            let delta = match ch.get("delta") {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Text content delta.
+            if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    if !self.block_started {
+                        self.block_started = true;
+                        out.push(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text", "text": ""}
+                            })
+                        ));
+                    }
+                    out.push(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": s}
+                        })
+                    ));
+                }
+            }
+
+            // Finish reason.
+            if let Some(reason) = ch.get("finish_reason").and_then(|v| v.as_str()) {
+                self.stop_reason = match reason {
+                    "stop" => "end_turn".into(),
+                    "length" => "max_tokens".into(),
+                    other => other.to_string(),
+                };
+            }
+        }
+
+        out
+    }
+
+    fn finish(&mut self, out: &mut Vec<String>) {
+        if self.finished {
+            return;
+        }
+        if !self.started {
+            let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+            out.push(format!(
+                "event: message_start\ndata: {}\n\n",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                })
+            ));
+        }
+        if self.block_started {
+            out.push(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                json!({"type": "content_block_stop", "index": 0})
+            ));
+        }
+        let stop = if self.stop_reason.is_empty() {
+            "end_turn".to_string()
+        } else {
+            self.stop_reason.clone()
+        };
+        out.push(format!(
+            "event: message_delta\ndata: {}\n\n",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": null},
+                "usage": {
+                    "input_tokens": self.input_tokens,
+                    "output_tokens": self.output_tokens,
+                }
+            })
+        ));
+        out.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+        self.usage.record(
+            &self.model,
+            self.input_tokens as i64,
+            self.output_tokens as i64,
+            (self.input_tokens + self.output_tokens) as i64,
+        );
+        self.finished = true;
+    }
+}
+
+impl Stream for OpenCodeSseTranslator {
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(data) = this.pop_event() {
+                let translated = this.translate(&data);
+                if !translated.is_empty() {
+                    return Poll::Ready(Some(Ok(Bytes::from(translated.concat()))));
+                }
+                continue;
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    let text = this.decoder.push(&chunk);
+                    this.buf.push_str(&text);
+                    continue;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(std::io::Error::other(e))));
+                }
+                Poll::Ready(None) => {
+                    if !this.finished {
+                        let mut tail = Vec::new();
+                        this.finish(&mut tail);
+                        return Poll::Ready(Some(Ok(Bytes::from(tail.concat()))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+fn opencode_stream_anthropic(
+    upstream: reqwest::Response,
+    model: String,
+    usage: Arc<crate::usage::UsageStore>,
+) -> Response {
+    let stream = OpenCodeSseTranslator::new(
+        upstream.bytes_stream().boxed(),
+        model,
+        usage,
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[cfg(test)]
