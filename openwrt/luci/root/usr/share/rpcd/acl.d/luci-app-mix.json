@@ -1,0 +1,14 @@
+{
+	"luci-app-mix": {
+		"description": "Grant access to Mimo Bridge LuCI app",
+		"read": {
+			"uci": [ "mix_api_bridge" ],
+			"ubus": {
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "mix_api_bridge" ]
+		}
+	}
+}

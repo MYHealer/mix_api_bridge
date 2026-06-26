@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macos-universal
+            archive: mix_api_bridge_${{ github.ref_name }}_macos_universal.zip
+          - os: windows-2022
+            label: windows-x64
+            archive: mix_api_bridge_${{ github.ref_name }}_windows_x64.zip
+          - os: windows-11-arm
+            label: windows-arm64
+            archive: mix_api_bridge_${{ github.ref_name }}_windows_arm64.zip
+          - os: ubuntu-22.04
+            label: linux-x64
+            archive: mix_api_bridge_${{ github.ref_name }}_linux_x64.tar.gz
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            archive: mix_api_bridge_${{ github.ref_name }}_linux_arm64.tar.gz
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.label }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Rust stable
+        if: runner.os != 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust stable with macOS targets
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WebUI
+        run: pnpm build
+
+      - name: Build macOS universal binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$target" --bin mix_api_bridge
+            cargo build --release --target "$target" --features desktop --bin mix_api_bridge_desktop
+          done
+          mkdir -p ../release
+          lipo -create \
+            target/aarch64-apple-darwin/release/mix_api_bridge \
+            target/x86_64-apple-darwin/release/mix_api_bridge \
+            -output ../release/mix_api_bridge
+          lipo -create \
+            target/aarch64-apple-darwin/release/mix_api_bridge_desktop \
+            target/x86_64-apple-darwin/release/mix_api_bridge_desktop \
+            -output ../release/mix_api_bridge_desktop
+          chmod +x ../release/mix_api_bridge ../release/mix_api_bridge_desktop
+          mkdir -p ../release/mix_api_bridge_desktop.app/Contents/MacOS
+          mkdir -p ../release/mix_api_bridge_desktop.app/Contents/Resources
+          cp ../release/mix_api_bridge_desktop ../release/mix_api_bridge_desktop.app/Contents/MacOS/
+          cp icons/icon.icns ../release/mix_api_bridge_desktop.app/Contents/Resources/icon.icns
+          cat > ../release/mix_api_bridge_desktop.app/Contents/Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>mix_api_bridge</string>
+            <key>CFBundleExecutable</key>
+            <string>mix_api_bridge_desktop</string>
+            <key>CFBundleIconFile</key>
+            <string>icon.icns</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.neoruaa.mix-api-bridge.desktop</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>mix_api_bridge</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>0.1.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>LSUIElement</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Build Unix binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo build --release --bin mix_api_bridge
+          cargo build --release --features desktop --bin mix_api_bridge_desktop
+          mkdir -p ../release
+          cp target/release/mix_api_bridge ../release/
+          cp target/release/mix_api_bridge_desktop ../release/
+
+      - name: Build Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd src-tauri
+          cargo build --release --bin mix_api_bridge
+          cargo build --release --features desktop --bin mix_api_bridge_desktop
+          New-Item -ItemType Directory -Force ../release | Out-Null
+          Copy-Item target/release/mix_api_bridge.exe ../release/
+          Copy-Item target/release/mix_api_bridge_desktop.exe ../release/
+
+      - name: Archive zip
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          cd release
+          7z a "../${{ matrix.archive }}" .
+
+      - name: Archive tar.gz
+        if: runner.os == 'Linux'
+        shell: bash
+        run: tar -czf "${{ matrix.archive }}" -C release .
+
+      - name: Compute date version
+        id: ver
+        shell: bash
+        run: echo "date=$(TZ=Asia/Shanghai date +'%y%m%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload draft release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "mix_api_bridge ${{ github.ref_name }} (${{ steps.ver.outputs.date }})"
+          body: "Draft release generated by GitHub Actions · build ${{ steps.ver.outputs.date }}. Assets include headless CLI/server and desktop tray binaries."
+          draft: true
+          prerelease: false
+          files: ${{ matrix.archive }}
