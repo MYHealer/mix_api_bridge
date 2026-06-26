@@ -80,7 +80,15 @@ pub async fn messages(
 
     // Route OpenCode free models to the OpenCode upstream.
     if ctrl.is_opencode_model(&model) {
-        return opencode_via_anthropic(ctrl, openai_body, model, stream_requested, started).await;
+        return opencode_via_anthropic(
+            ctrl,
+            openai_body,
+            model,
+            stream_requested,
+            thinking_enabled,
+            started,
+        )
+        .await;
     }
 
     match ctrl.mimo.chat(openai_body).await {
@@ -887,14 +895,15 @@ impl Stream for SseTranslator {
 ///
 /// The request body (`openai_body`) has already been converted from Anthropic
 /// Messages format to OpenAI Chat Completions format via `anthropic_to_openai_chat`.
-/// We forward it to the OpenCode upstream and stream the response back as-is.
-/// OpenCode models like `big-pickle` return Anthropic SSE natively, so passthrough
-/// gives the client correct Anthropic Messages events.
+/// We forward it to the OpenCode upstream (`/zen/v1/chat/completions`), then
+/// convert the OpenAI SSE response back to Anthropic Messages SSE — the same
+/// way Mimo responses are handled — so clients see valid Anthropic events.
 async fn opencode_via_anthropic(
     ctrl: Arc<ProxyController>,
     openai_body: Value,
     model: String,
-    _stream_requested: bool,
+    stream_requested: bool,
+    thinking_enabled: bool,
     started: std::time::Instant,
 ) -> Response {
     match ctrl.opencode.post_json(openai_body).await {
@@ -915,9 +924,13 @@ async fn opencode_via_anthropic(
                 let text = upstream.text().await.unwrap_or_default();
                 return (status, text).into_response();
             }
-            // Stream the upstream bytes through — OpenCode models like big-pickle
-            // return Anthropic SSE natively.
-            super::transport::proxy_response_tapped(ctrl, model, upstream).await
+            // OpenCode returns OpenAI Chat Completions SSE, so we need to
+            // convert back to Anthropic Messages format — same as Mimo.
+            if stream_requested {
+                stream_anthropic(upstream, model, ctrl.usage.clone(), thinking_enabled)
+            } else {
+                aggregate_anthropic(upstream, model, ctrl.usage.clone(), thinking_enabled).await
+            }
         }
         Err(e) => {
             super::emit_log(
