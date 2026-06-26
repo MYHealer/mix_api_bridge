@@ -76,6 +76,8 @@ async fn chat_completions(ctrl: Arc<ProxyController>, body: Value) -> Response {
         super::transport::request_log(&ctrl, crate::mimo::PATH_CHAT, &body),
     );
 
+    // Rate-limit concurrent upstream calls.
+    let _permit = ctrl.semaphore.acquire().await.unwrap();
     match ctrl.mimo.post_json(crate::mimo::PATH_CHAT, body).await {
         Ok(upstream) => {
             let status = upstream.status();
@@ -806,6 +808,8 @@ async fn responses_passthrough_or_compat(ctrl: Arc<ProxyController>, body: Value
         super::transport::request_log(&ctrl, crate::mimo::PATH_RESPONSES, &body),
     );
 
+    // Rate-limit concurrent upstream calls.
+    let _permit = ctrl.semaphore.acquire().await.unwrap();
     match ctrl
         .mimo
         .post_json(crate::mimo::PATH_RESPONSES, body.clone())

@@ -90,6 +90,8 @@ pub async fn forward(ctrl: Arc<ProxyController>, upstream_path: &str, body: Valu
         "→ mimo {upstream_path} stream={stream_requested} model={model}"
     );
     emit_log(&ctrl, request_log(&ctrl, upstream_path, &body));
+    // Rate-limit concurrent upstream calls.
+    let _permit = ctrl.semaphore.acquire().await.unwrap();
     match ctrl.mimo.post_json(upstream_path, body).await {
         Ok(upstream) => {
             let status = upstream.status();
@@ -302,6 +304,8 @@ pub async fn opencode_forward(ctrl: Arc<ProxyController>, body: Value) -> Respon
         request_log(&ctrl, crate::opencode::PATH_CHAT, &body),
     );
 
+    // Rate-limit concurrent upstream calls.
+    let _permit = ctrl.semaphore.acquire().await.unwrap();
     match ctrl.opencode.post_json(body).await {
         Ok(upstream) => {
             let status = upstream.status();

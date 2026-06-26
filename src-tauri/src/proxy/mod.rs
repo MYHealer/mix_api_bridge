@@ -12,6 +12,7 @@ use crate::opencode::OpenCodeClient;
 use crate::state::LogEmitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub struct ProxyController {
     pub mimo: Arc<MimoClient>,
@@ -19,6 +20,7 @@ pub struct ProxyController {
     pub emitter: LogEmitter,
     pub usage: Arc<crate::usage::UsageStore>,
     verbose: AtomicBool,
+    semaphore: Semaphore,
 }
 
 impl ProxyController {
@@ -34,6 +36,7 @@ impl ProxyController {
             emitter,
             usage,
             verbose: AtomicBool::new(false),
+            semaphore: Semaphore::new(4),
         }
     }
 
