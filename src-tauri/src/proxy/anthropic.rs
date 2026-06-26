@@ -92,7 +92,7 @@ pub async fn messages(
     }
 
     // Rate-limit concurrent upstream calls.
-    let _permit = ctrl.semaphore.acquire().await.unwrap();
+    let _permit = ctrl.semaphore.clone().acquire_owned().await.unwrap();
     match ctrl.mimo.chat(openai_body).await {
         Ok(upstream) => {
             let status =
@@ -909,7 +909,7 @@ async fn opencode_via_anthropic(
     started: std::time::Instant,
 ) -> Response {
     // Rate-limit concurrent upstream calls.
-    let _permit = ctrl.semaphore.acquire().await.unwrap();
+    let _permit = ctrl.semaphore.clone().acquire_owned().await.unwrap();
     match ctrl.opencode.post_json(openai_body).await {
         Ok(upstream) => {
             let status =

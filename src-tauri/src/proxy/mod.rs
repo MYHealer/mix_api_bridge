@@ -20,7 +20,7 @@ pub struct ProxyController {
     pub emitter: LogEmitter,
     pub usage: Arc<crate::usage::UsageStore>,
     verbose: AtomicBool,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
 }
 
 impl ProxyController {
@@ -36,7 +36,7 @@ impl ProxyController {
             emitter,
             usage,
             verbose: AtomicBool::new(false),
-            semaphore: Semaphore::new(4),
+            semaphore: Arc::new(Semaphore::new(4)),
         }
     }
 
